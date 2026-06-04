@@ -1,0 +1,278 @@
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+
+	<link rel="manifest" href="manifest.webmanifest">
+	<link rel="apple-touch-icon" href="icon-192.png">
+
+	<meta name="theme-color" content="#222222">
+	<meta name="apple-mobile-web-app-capable" content="yes">
+	<meta name="apple-mobile-web-app-title" content="Image Edit">
+</head>
+
+<script>
+
+function fileSelected(evt, element) {
+	// url to file
+	const file = element.files[0];
+	if (!file) {
+		return;
+	}
+	display_image(file);
+};
+
+const display_image = function(data) {
+	// display the image
+	const canvas = document.getElementById('picture');
+	const ctx = canvas.getContext('2d');
+	const image = new Image();
+	const imageUrl = URL.createObjectURL(data);
+
+	image.onload = () => {
+		const maxImageSide = 600;
+		const scale = Math.min(maxImageSide / image.naturalWidth, maxImageSide / image.naturalHeight, 1);
+		const drawWidth = Math.round(image.naturalWidth * scale);
+		const drawHeight = Math.round(image.naturalHeight * scale);
+		const canvasSide = Math.ceil(Math.hypot(drawWidth, drawHeight));
+		const dx = (canvasSide - drawWidth) / 2;
+		const dy = (canvasSide - drawHeight) / 2;
+
+		canvas.width = canvasSide;
+		canvas.height = canvasSide;
+		ctx.clearRect(0, 0, canvas.width, canvas.height);
+		ctx.drawImage(image, dx, dy, drawWidth, drawHeight);
+		URL.revokeObjectURL(imageUrl);
+	};
+	image.onerror = () => {
+		console.error("Error loading image.");
+		URL.revokeObjectURL(imageUrl);
+	};
+
+	image.src = imageUrl;
+};
+
+const filter_blur = function(val) {
+	const canvas = document.getElementById('picture');
+	if (!canvas) {
+		return;
+	}
+	canvas.style.filter = `blur(${val}px)`;
+};
+
+const filter_rotate = function(deg) {
+	const canvas = document.getElementById('picture');
+	if (!canvas || canvas.width === 0 || canvas.height === 0) {
+		return;
+	}
+
+	const ctx = canvas.getContext('2d');
+	const srcCanvas = document.createElement('canvas');
+	srcCanvas.width = canvas.width;
+	srcCanvas.height = canvas.height;
+	srcCanvas.getContext('2d').drawImage(canvas, 0, 0);
+
+	const rad = deg * Math.PI / 180;
+	const w = canvas.width;
+	const h = canvas.height;
+
+	ctx.clearRect(0, 0, w, h);
+	ctx.translate(w / 2, h / 2);
+	ctx.rotate(rad);
+	ctx.drawImage(srcCanvas, -srcCanvas.width / 2, -srcCanvas.height / 2);
+	ctx.setTransform(1, 0, 0, 1, 0, 0);
+};
+
+const filter_negate = function() {
+	const canvas = document.getElementById('picture');
+	if (!canvas || canvas.width === 0 || canvas.height === 0) {
+		return;
+	}
+
+	const ctx = canvas.getContext('2d');
+	const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+	const data = imageData.data;
+
+	// 4th value is transparency
+	for (let i = 0; i < data.length; i += 4) {
+		data[i] = 255 - data[i];
+		data[i + 1] = 255 - data[i + 1];
+		data[i + 2] = 255 - data[i + 2];
+	}
+
+	ctx.putImageData(imageData, 0, 0);
+};
+
+const convWorkerCode = `
+self.onmessage = function(evt) {
+	const { buffer, width, height, kernel, divisor, bias } = evt.data;
+
+	const src = new Uint8ClampedArray(buffer);
+	const dst = new Uint8ClampedArray(src.length);
+
+	for (let i = 0; i < src.length; i++) {
+		dst[i] = src[i];
+	}
+
+	for (let y = 1; y < height - 1; y++) {
+		for (let x = 1; x < width - 1; x++) {
+			const address = (y * width + x) * 4;
+
+			for (let k = 0; k <= 2; k++) {
+				let tmp = 0;
+				let kernelIdx = 0;
+
+				for (let m = -1; m <= 1; m++) {
+					for (let n = -1; n <= 1; n++) {
+						const neighbourAddress = ((y + m) * width + (x + n)) * 4;
+						tmp += src[neighbourAddress + k] * kernel[kernelIdx];
+						kernelIdx++;
+					}
+				}
+
+				dst[address + k] = Math.max(0, Math.min(255, tmp / divisor + bias));
+			}
+
+			dst[address + 3] = src[address + 3];
+		}
+	}
+
+	self.postMessage({ buffer: dst.buffer, width, height }, [dst.buffer]);
+};
+`;
+
+const convWorker = new Worker(
+	URL.createObjectURL(new Blob([convWorkerCode], { type: "application/javascript" }))
+);
+
+const convFilters = {
+	sharpen: {
+		kernel: [
+			 0, -1,  0,
+			-1,  5, -1,
+			 0, -1,  0
+		],
+		divisor: 1,
+		bias: 0
+	},
+	edge: {
+		kernel: [
+			-1, -1, -1,
+			-1,  8, -1,
+			-1, -1, -1
+		],
+		divisor: 1,
+		bias: 0
+	},
+	emboss: {
+		kernel: [
+			-2, -1, 0,
+			-1,  1, 1,
+			 0,  1, 2
+		],
+		divisor: 1,
+		bias: 128
+	}
+};
+
+const filter_conv = function(filterName) {
+	const canvas = document.getElementById('picture');
+
+	if (!canvas || canvas.width === 0 || canvas.height === 0) {
+		return;
+	}
+
+	const selectedFilter = convFilters[filterName];
+
+	if (!selectedFilter) {
+		return;
+	}
+
+	const X = canvas.width;
+	const Y = canvas.height;
+	const ctx = canvas.getContext('2d');
+	const imageData = ctx.getImageData(0, 0, X, Y);
+
+	convWorker.onmessage = function(evt) {
+		const { buffer, width, height } = evt.data;
+		const resultData = new Uint8ClampedArray(buffer);
+		const resultImageData = new ImageData(resultData, width, height);
+
+		ctx.putImageData(resultImageData, 0, 0);
+	};
+
+	convWorker.postMessage({
+		buffer: imageData.data.buffer,
+		width: X,
+		height: Y,
+		kernel: selectedFilter.kernel,
+		divisor: selectedFilter.divisor,
+		bias: selectedFilter.bias
+	}, [imageData.data.buffer]);
+};
+
+window.addEventListener('DOMContentLoaded', () => {
+	const rotateBtnLeft = document.getElementById('btn-rotate-left');
+	const rotateBtnRight = document.getElementById('btn-rotate-right');
+	const negateBtn = document.getElementById('btn-negate');
+	const blurSlider = document.getElementById('blur-slider');
+	const blurValue = document.getElementById('blur-value');
+	const sharpenBtn = document.getElementById('btn-sharpen');
+	const edgeBtn = document.getElementById('btn-edge');
+	const embossBtn = document.getElementById('btn-emboss');
+
+	rotateBtnLeft.addEventListener('click', () => filter_rotate(-45));
+	rotateBtnRight.addEventListener('click', () => filter_rotate(45));
+	negateBtn.addEventListener('click', () => filter_negate());
+	blurSlider.addEventListener('input', (evt) => {
+		const val = Number(evt.target.value);
+		blurValue.textContent = `${val}px`;
+		filter_blur(val);
+	});
+	sharpenBtn.addEventListener('click', () => filter_conv('sharpen'));
+	edgeBtn.addEventListener('click', () => filter_conv('edge'));
+	embossBtn.addEventListener('click', () => filter_conv('emboss'));
+});
+
+const donwloadIMG = function() {
+	const dwnldEL = document.createElement('a');
+	dwnldEL.href = kanvas.toDataURL();
+	dwnldEL.download = 'obr.png';
+	console.log('Donwloading');
+	console.dir(dwnldEL);
+	dwnldEL.click();
+	dwnldEL.remove();
+};
+
+</script>
+
+File:
+<input type="file" onchange="fileSelected(event, this);">
+
+Camera:
+<input type="file" accept="image/*" capture="camera" onchange="fileSelected(event, this);">
+
+<canvas id="picture"></canvas>
+
+<fieldset>
+	<legend>BLUR</legend>
+	<input id="blur-slider" type="range" min="0" max="20" value="0">
+	<span id="blur-value">0px</span>
+</fieldset>
+
+<fieldset>
+	<legend>ROTATE</legend>
+	<button id="btn-rotate-left" type="button">-45</button>
+	<button id="btn-rotate-right" type="button">45</button>
+</fieldset>
+
+<fieldset>
+	<legend>NEGATE</legend>
+	<button id="btn-negate" type="button">Negate</button>
+</fieldset>
+
+<fieldset>
+	<legend>CONVOLUTION</legend>
+	<button id="btn-sharpen" type="button">Sharpen</button>
+	<button id="btn-edge" type="button">Edge Detect</button>
+	<button id="btn-emboss" type="button">Emboss</button>
+</fieldset>
