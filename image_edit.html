@@ -1,3 +1,5 @@
+<!doctype html>
+<html lang="en">
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
@@ -5,12 +7,43 @@
 
 	<link rel="manifest" href="manifest.webmanifest">
 	<link rel="icon" href="icon.svg" type="image/svg+xml">
-	<link rel="apple-touch-icon" href="icon.svg">
+	<link rel="apple-touch-icon" href="icon-192.png">
 
 	<meta name="theme-color" content="#222222">
 	<meta name="apple-mobile-web-app-capable" content="yes">
 	<meta name="apple-mobile-web-app-title" content="Image Edit">
+
+	<style>
+		body {
+			box-sizing: border-box;
+			max-width: 760px;
+			margin: 0 auto;
+			padding: 16px;
+			font-family: system-ui, sans-serif;
+		}
+
+		canvas {
+			display: block;
+			width: 100%;
+			max-width: 600px;
+			height: auto;
+			margin: 16px 0;
+			background: #eeeeee;
+			border: 1px solid #cccccc;
+		}
+
+		fieldset {
+			margin: 12px 0;
+		}
+
+		button,
+		input {
+			font: inherit;
+		}
+	</style>
 </head>
+
+<body>
 
 <script>
 
@@ -28,7 +61,6 @@ const display_image = function(data) {
 	const canvas = document.getElementById('picture');
 	const ctx = canvas.getContext('2d');
 	const image = new Image();
-	const imageUrl = URL.createObjectURL(data);
 
 	image.onload = () => {
 		const maxImageSide = 600;
@@ -43,14 +75,19 @@ const display_image = function(data) {
 		canvas.height = canvasSide;
 		ctx.clearRect(0, 0, canvas.width, canvas.height);
 		ctx.drawImage(image, dx, dy, drawWidth, drawHeight);
-		URL.revokeObjectURL(imageUrl);
 	};
 	image.onerror = () => {
 		console.error("Error loading image.");
-		URL.revokeObjectURL(imageUrl);
 	};
 
-	image.src = imageUrl;
+	const reader = new FileReader();
+	reader.onload = () => {
+		image.src = reader.result;
+	};
+	reader.onerror = () => {
+		console.error("Error reading image.");
+	};
+	reader.readAsDataURL(data);
 };
 
 const filter_blur = function(val) {
@@ -142,9 +179,48 @@ self.onmessage = function(evt) {
 };
 `;
 
-const convWorker = new Worker(
-	URL.createObjectURL(new Blob([convWorkerCode], { type: "application/javascript" }))
-);
+let convWorker = null;
+
+try {
+	convWorker = new Worker(
+		URL.createObjectURL(new Blob([convWorkerCode], { type: "application/javascript" }))
+	);
+} catch (err) {
+	console.error("Worker creation failed:", err);
+}
+
+const runConvolution = function(src, width, height, kernel, divisor, bias) {
+	const dst = new Uint8ClampedArray(src.length);
+
+	for (let i = 0; i < src.length; i++) {
+		dst[i] = src[i];
+	}
+
+	for (let y = 1; y < height - 1; y++) {
+		for (let x = 1; x < width - 1; x++) {
+			const address = (y * width + x) * 4;
+
+			for (let k = 0; k <= 2; k++) {
+				let tmp = 0;
+				let kernelIdx = 0;
+
+				for (let m = -1; m <= 1; m++) {
+					for (let n = -1; n <= 1; n++) {
+						const neighbourAddress = ((y + m) * width + (x + n)) * 4;
+						tmp += src[neighbourAddress + k] * kernel[kernelIdx];
+						kernelIdx++;
+					}
+				}
+
+				dst[address + k] = Math.max(0, Math.min(255, tmp / divisor + bias));
+			}
+
+			dst[address + 3] = src[address + 3];
+		}
+	}
+
+	return dst;
+};
 
 const convFilters = {
 	sharpen: {
@@ -194,6 +270,19 @@ const filter_conv = function(filterName) {
 	const ctx = canvas.getContext('2d');
 	const imageData = ctx.getImageData(0, 0, X, Y);
 
+	if (!convWorker) {
+		const resultData = runConvolution(
+			imageData.data,
+			X,
+			Y,
+			selectedFilter.kernel,
+			selectedFilter.divisor,
+			selectedFilter.bias
+		);
+		ctx.putImageData(new ImageData(resultData, X, Y), 0, 0);
+		return;
+	}
+
 	convWorker.onmessage = function(evt) {
 		const { buffer, width, height } = evt.data;
 		const resultData = new Uint8ClampedArray(buffer);
@@ -221,6 +310,7 @@ window.addEventListener('DOMContentLoaded', () => {
 	const sharpenBtn = document.getElementById('btn-sharpen');
 	const edgeBtn = document.getElementById('btn-edge');
 	const embossBtn = document.getElementById('btn-emboss');
+	const downloadBtn = document.getElementById('btn-download');
 
 	rotateBtnLeft.addEventListener('click', () => filter_rotate(-45));
 	rotateBtnRight.addEventListener('click', () => filter_rotate(45));
@@ -233,6 +323,7 @@ window.addEventListener('DOMContentLoaded', () => {
 	sharpenBtn.addEventListener('click', () => filter_conv('sharpen'));
 	edgeBtn.addEventListener('click', () => filter_conv('edge'));
 	embossBtn.addEventListener('click', () => filter_conv('emboss'));
+	downloadBtn.addEventListener('click', () => downloadIMG());
 });
 
 if ("serviceWorker" in navigator) {
@@ -242,12 +333,24 @@ if ("serviceWorker" in navigator) {
 	});
 }
 
-const donwloadIMG = function() {
+const downloadIMG = function() {
+	const canvas = document.getElementById('picture');
+
+	if (!canvas || canvas.width === 0 || canvas.height === 0) {
+		return;
+	}
+
+	const exportCanvas = document.createElement('canvas');
+	const exportCtx = exportCanvas.getContext('2d');
+
+	exportCanvas.width = canvas.width;
+	exportCanvas.height = canvas.height;
+	exportCtx.filter = canvas.style.filter || "none";
+	exportCtx.drawImage(canvas, 0, 0);
+
 	const dwnldEL = document.createElement('a');
-	dwnldEL.href = kanvas.toDataURL();
+	dwnldEL.href = exportCanvas.toDataURL('image/png');
 	dwnldEL.download = 'obr.png';
-	console.log('Donwloading');
-	console.dir(dwnldEL);
 	dwnldEL.click();
 	dwnldEL.remove();
 };
@@ -285,3 +388,11 @@ Camera:
 	<button id="btn-edge" type="button">Edge Detect</button>
 	<button id="btn-emboss" type="button">Emboss</button>
 </fieldset>
+
+<fieldset>
+	<legend>DOWNLOAD</legend>
+	<button id="btn-download" type="button">Download image</button>
+</fieldset>
+
+</body>
+</html>
